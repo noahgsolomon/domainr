@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use rcgen::{CertificateParams, IsCa, BasicConstraints, KeyPair};
+use rcgen::{Certificate, CertificateParams, IsCa, BasicConstraints, KeyPair};
 use std::{env, fs, path::PathBuf, process::Command, io::Write, collections::HashMap};
 use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
@@ -12,12 +12,13 @@ use std::sync::Arc;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use std::str::FromStr;
-use rustls::{Certificate as RustlsCertificate, PrivateKey};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ServerConfig, ServerConnection};
 use rustls::Stream;
-use rustls::sign::any_supported_type;
 use rcgen::{CertificateParams as RcgenParams, Certificate as RcgenCert, DnType, SanType, KeyPair as RcgenKeyPair};
 use std::sync::Arc as StdArc; // avoid conflict with super::Arc
+use pem;
+use native_tls;
 
 #[derive(Parser)]
 #[command(name = "domainr", version, about = "CLI for custom domain remapping")]
@@ -290,7 +291,8 @@ mod dns_server {
                                 if question.query_class() == DNSClass::IN && question.query_type() == RecordType::A {
                                     // Check if this domain is in our mappings
                                     let is_mapped = mappings.domains.contains_key(domain) || 
-                                                   mappings.domains.values().any(|v| v == domain);
+                                                   mappings.domains.values().any(|v| v == domain) ||
+                                                   is_subdomain_of_mapped_domain(domain, &mappings);
                                     
                                     if is_mapped {
                                         println!("Domain {} is mapped, returning 127.0.0.1", domain);
@@ -337,6 +339,35 @@ mod dns_server {
                 }
             }
         }
+    }
+    
+    // Helper function to check if a domain is a subdomain of any mapped domain
+    fn is_subdomain_of_mapped_domain(domain: &str, mappings: &Mappings) -> bool {
+        // Check if this is a subdomain of any upstream domain
+        for upstream in mappings.domains.values() {
+            if domain == upstream {
+                return true;
+            }
+            
+            // Check if it's a subdomain (e.g., api.x.com when x.com is an upstream)
+            if domain.ends_with(&format!(".{}", upstream)) {
+                return true;
+            }
+        }
+        
+        // Check if this is a subdomain of any alias domain
+        for alias in mappings.domains.keys() {
+            if domain == alias {
+                return true;
+            }
+            
+            // Check if it's a subdomain (e.g., api.a.a when a.a is an alias)
+            if domain.ends_with(&format!(".{}", alias)) {
+                return true;
+            }
+        }
+        
+        false
     }
 }
 
@@ -419,27 +450,81 @@ mod https_proxy {
         Ok((cert, key))
     }
     
-    // NEW: Generate a leaf certificate for a hostname signed by our CA
-    fn generate_leaf_cert(hostname: &str, ca_cert_pem: &str, ca_key_pem: &str) -> Result<(Vec<RustlsCertificate>, PrivateKey)> {
-        // Reconstruct CA cert with key pair so rcgen can sign
-        let ca_key_pair = RcgenKeyPair::from_pem(ca_key_pem)?;
-        let ca_params = rcgen::CertificateParams::from_ca_cert_pem(ca_cert_pem.to_string(), ca_key_pair)?;
-        let ca_cert = RcgenCert::from_params(ca_params)?;
-
-        // Build leaf params
-        let mut leaf_params = RcgenParams::new(vec![hostname.to_string()])?;
-        leaf_params.distinguished_name.push(DnType::CommonName, hostname);
-        leaf_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
-        leaf_params.is_ca = IsCa::ExplicitNoCa;
-        let leaf_cert = RcgenCert::from_params(leaf_params)?;
-
-        // Serialize leaf cert signed by CA
-        let leaf_der = leaf_cert.serialize_der_with_signer(&ca_cert)?;
-        let leaf_key_der = leaf_cert.serialize_private_key_der();
-
-        // Build rustls objects
-        let cert_chain = vec![RustlsCertificate(leaf_der)];
-        let key = PrivateKey(leaf_key_der);
+    // Generate a certificate for a hostname signed by our CA
+    fn generate_leaf_cert(hostname: &str, ca_cert_pem: &str, ca_key_pem: &str) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+        // Parse the CA key
+        let ca_key_pair = KeyPair::from_pem(ca_key_pem)?;
+        
+        // Create the leaf certificate parameters with proper SAN entries
+        let mut cert_domains = vec![hostname.to_string()];
+        
+        // Add wildcard domain as a SAN for better compatibility
+        if hostname.split('.').count() > 1 && !hostname.parse::<IpAddr>().is_ok() {
+            // For a domain like "example.com" add "*.example.com"
+            cert_domains.push(format!("*.{}", hostname));
+            
+            // If this is already a subdomain, also add the base domain
+            // For "api.example.com", extract and add "example.com"
+            let parts: Vec<&str> = hostname.split('.').collect();
+            if parts.len() > 2 {
+                let base_domain = parts[parts.len()-2..].join(".");
+                cert_domains.push(base_domain.clone());
+                cert_domains.push(format!("*.{}", base_domain));
+            }
+        }
+        
+        // Create certificate parameters with all domains
+        let mut params = CertificateParams::new(cert_domains)?;
+        
+        // Set proper certificate attributes
+        params.distinguished_name.push(DnType::CommonName, hostname);
+        params.is_ca = IsCa::ExplicitNoCa;
+        
+        // Add key usage extensions for proper validation
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ];
+        
+        // Add extended key usage for TLS web server and client authentication
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        
+        // Create a leaf key pair
+        let leaf_key_pair = KeyPair::generate()?;
+        
+        // Parse the CA certificate from PEM
+        let ca_cert_pem_data = pem::parse(ca_cert_pem)
+            .context("Failed to parse CA certificate PEM")?;
+            
+        // Create a simple CA certificate that can be used for signing
+        let mut ca_params = CertificateParams::new(vec![])?;
+        ca_params.distinguished_name.push(DnType::CommonName, "domainr-root-ca");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key_pair)?;
+        
+        // Sign the leaf certificate with the CA
+        let leaf_cert = params.signed_by(&leaf_key_pair, &ca_cert, &ca_key_pair)?;
+        
+        // Extract the CA certificate in DER format
+        let ca_cert_der = ca_cert_pem_data.contents().to_vec();
+        
+        // Create the certificate chain - we need both the leaf and CA certificates
+        let cert_chain = vec![
+            // Leaf certificate first
+            CertificateDer::from(leaf_cert.der().to_vec()),
+            // Then the CA certificate
+            CertificateDer::from(ca_cert_der),
+        ];
+        
+        // Private key from the leaf certificate
+        let key_der = leaf_key_pair.serialize_der();
+        let key = rustls::pki_types::PrivateKeyDer::from(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der)
+        );
+        
         Ok((cert_chain, key))
     }
     
@@ -585,55 +670,149 @@ mod https_proxy {
                 println!("SNI hostname: {}", sni);
                 
                 // Check if this domain is in our mappings
-                let is_mapped = mappings.domains.contains_key(&sni) || 
-                                mappings.domains.values().any(|v| v == &sni);
-                                    
-                if is_mapped {
-                    println!("Domain {} is mapped in our config", sni);
-
-                    // Load CA material
-                    let (ca_cert_pem, ca_key_pem) = load_ca()?;
-
-                    // Generate or fetch leaf certificate for this SNI
-                    let (cert_chain, priv_key) = generate_leaf_cert(&sni, &ca_cert_pem, &ca_key_pem)?;
-
-                    // Build a rustls ServerConfig for this connection
-                    let mut server_config = ServerConfig::builder()
-                        .with_no_client_auth()
-                        .with_single_cert(cert_chain, priv_key)?;
-                    server_config.alpn_protocols.push(b"http/1.1".to_vec());
-
-                    let config_arc = StdArc::new(server_config);
-                    let mut server_conn = ServerConnection::new(config_arc)?;
-
-                    // Complete handshake, using the existing stream
-                    loop {
-                        match server_conn.complete_io(&mut client_stream) {
-                            Ok((_rd, _wr)) => {
-                                if !server_conn.is_handshaking() {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("TLS handshake error: {}", e);
-                                return Ok(());
-                            }
-                        }
-                    }
-
-                    println!("TLS handshake with {} completed", sni);
-
-                    // At this point we have a secure stream. For now just read the first HTTP request line.
-                    let mut tls_stream = Stream::new(&mut server_conn, &mut client_stream);
-                    let mut http_buf = Vec::new();
-                    let _ = tls_stream.read_to_end(&mut http_buf);
-                    println!("{} bytes received over TLS", http_buf.len());
-                    // TODO: Forward to upstream and relay response.
-                    return Ok(());
+                let upstream_domain = if let Some(upstream) = mappings.domains.get(&sni) {
+                    println!("Found mapping: {} -> {}", sni, upstream);
+                    upstream.clone()
+                } else if mappings.domains.values().any(|v| v == &sni) {
+                    println!("This is an upstream domain in our mappings");
+                    sni.clone()
                 } else {
                     println!("Domain {} is not in our mappings", sni);
-                    // TODO: Transparent tunnel for unmapped domains
+                    sni.clone()
+                };
+                
+                // Proceed with TLS handling for all domains
+                // Load CA material
+                let (ca_cert_pem, ca_key_pem) = load_ca()?;
+
+                // Generate or fetch leaf certificate for this SNI
+                let (cert_chain, priv_key) = generate_leaf_cert(&sni, &ca_cert_pem, &ca_key_pem)?;
+
+                // Build a rustls ServerConfig for this connection
+                let mut server_config = ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(cert_chain, priv_key)?;
+                server_config.alpn_protocols.push(b"http/1.1".to_vec());
+
+                let config_arc = StdArc::new(server_config);
+                let mut server_conn = ServerConnection::new(config_arc)?;
+
+                // Complete handshake, using the existing stream
+                loop {
+                    match server_conn.complete_io(&mut client_stream) {
+                        Ok((_rd, _wr)) => {
+                            if !server_conn.is_handshaking() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("TLS handshake error: {}", e);
+                            return Ok(());
+                        }
+                    }
                 }
+
+                println!("TLS handshake with {} completed", sni);
+
+                // At this point we have a secure stream
+                let mut tls_stream = Stream::new(&mut server_conn, &mut client_stream);
+                
+                // Parse the HTTP request
+                let mut request_buffer = Vec::new();
+                let mut headers_end = None;
+                let mut total_read = 0;
+                
+                // Read data until we find the end of headers (marked by "\r\n\r\n")
+                let mut temp_buffer = [0; 4096];
+                while headers_end.is_none() {
+                    match tls_stream.read(&mut temp_buffer) {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            request_buffer.extend_from_slice(&temp_buffer[..n]);
+                            total_read += n;
+                            
+                            // Search for end of headers
+                            if request_buffer.len() >= 4 {
+                                for i in 0..request_buffer.len() - 3 {
+                                    if &request_buffer[i..i+4] == b"\r\n\r\n" {
+                                        headers_end = Some(i + 4);
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            // Don't read too much data
+                            if total_read > 1024 * 1024 { // 1MB limit
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading HTTP request: {}", e);
+                            return Ok(());
+                        }
+                    }
+                }
+                
+                // Convert to string for parsing
+                if let Some(headers_end) = headers_end {
+                    let headers_str = String::from_utf8_lossy(&request_buffer[..headers_end]);
+                    let headers_lines: Vec<&str> = headers_str.lines().collect();
+                    
+                    if headers_lines.is_empty() {
+                        eprintln!("Invalid HTTP request: no headers");
+                        return Ok(());
+                    }
+                    
+                    // Parse request line
+                    let request_parts: Vec<&str> = headers_lines[0].split_whitespace().collect();
+                    if request_parts.len() < 3 {
+                        eprintln!("Invalid HTTP request line: {}", headers_lines[0]);
+                        return Ok(());
+                    }
+                    
+                    let method = request_parts[0];
+                    let path = request_parts[1];
+                    let version = request_parts[2];
+                    
+                    println!("HTTP request: {} {} {}", method, path, version);
+                    
+                    // Extract host header
+                    let mut host_header = None;
+                    for line in &headers_lines[1..] {
+                        if line.to_lowercase().starts_with("host:") {
+                            host_header = Some(line.trim_start_matches("host:").trim());
+                            break;
+                        }
+                    }
+                    
+                    if let Some(host) = host_header {
+                        println!("Host header: {}", host);
+                        
+                        // Modify the request to target the upstream server
+                        let modified_request = create_modified_request(
+                            &request_buffer, 
+                            &headers_lines,
+                            headers_end,
+                            &sni,
+                            &upstream_domain
+                        )?;
+                        
+                        // Connect to the upstream server
+                        if let Err(e) = forward_to_upstream(
+                            &modified_request,
+                            &upstream_domain,
+                            &mut tls_stream
+                        ) {
+                            eprintln!("Error forwarding to upstream: {}", e);
+                        }
+                    } else {
+                        eprintln!("No Host header found in request");
+                    }
+                } else {
+                    eprintln!("Could not find end of HTTP headers");
+                }
+                
+                return Ok(());
             } else {
                 println!("Could not extract SNI from ClientHello");
             }
@@ -642,6 +821,257 @@ mod https_proxy {
             client_stream.write_all(b"Would process TLS here in a real implementation").ok();
         }
         
+        Ok(())
+    }
+    
+    // Create a modified HTTP request to forward to the upstream server
+    fn create_modified_request(
+        original_request: &[u8],
+        headers_lines: &[&str],
+        headers_end: usize,
+        original_domain: &str,
+        upstream_domain: &str,
+    ) -> Result<Vec<u8>> {
+        let mut modified_request = Vec::new();
+        
+        // Extract the first line (method, path, version)
+        let request_line_parts: Vec<&str> = headers_lines[0].split_whitespace().collect();
+        if request_line_parts.len() < 3 {
+            anyhow::bail!("Invalid request line");
+        }
+        
+        // Add the request line unchanged
+        modified_request.extend_from_slice(headers_lines[0].as_bytes());
+        modified_request.extend_from_slice(b"\r\n");
+        
+        // Keep track of the original Host header value for rewriting URLs
+        let mut original_host = original_domain.to_string();
+        
+        // Add all headers except Host, modifying as needed
+        for &line in &headers_lines[1..] {
+            if line.is_empty() {
+                continue;
+            }
+            
+            if line.to_lowercase().starts_with("host:") {
+                // Extract the original host value for later use
+                let host_parts: Vec<&str> = line.splitn(2, ':').collect();
+                if host_parts.len() > 1 {
+                    original_host = host_parts[1].trim().to_string();
+                }
+                
+                // Replace the host header with the upstream domain
+                modified_request.extend_from_slice(b"Host: ");
+                modified_request.extend_from_slice(upstream_domain.as_bytes());
+                modified_request.extend_from_slice(b"\r\n");
+            } else if line.to_lowercase().starts_with("origin:") {
+                // Replace Origin header to avoid CORS issues
+                let new_origin = format!("Origin: https://{}", upstream_domain);
+                modified_request.extend_from_slice(new_origin.as_bytes());
+                modified_request.extend_from_slice(b"\r\n");
+            } else if line.to_lowercase().starts_with("referer:") {
+                // Rewrite Referer header to use upstream domain
+                let referer_parts: Vec<&str> = line.splitn(2, ':').collect();
+                if referer_parts.len() > 1 {
+                    let referer_value = referer_parts[1].trim();
+                    let new_referer = referer_value.replace(&original_host, upstream_domain);
+                    modified_request.extend_from_slice(b"Referer: ");
+                    modified_request.extend_from_slice(new_referer.as_bytes());
+                    modified_request.extend_from_slice(b"\r\n");
+                } else {
+                    // Keep original if we can't parse it
+                    modified_request.extend_from_slice(line.as_bytes());
+                    modified_request.extend_from_slice(b"\r\n");
+                }
+            } else {
+                // Keep other headers as is
+                modified_request.extend_from_slice(line.as_bytes());
+                modified_request.extend_from_slice(b"\r\n");
+            }
+        }
+        
+        // Add CORS headers to allow cross-origin requests
+        modified_request.extend_from_slice(b"X-Forwarded-Host: ");
+        modified_request.extend_from_slice(original_host.as_bytes());
+        modified_request.extend_from_slice(b"\r\n");
+        
+        // End of headers
+        modified_request.extend_from_slice(b"\r\n");
+        
+        // Append the body if any, rewriting domain references if needed
+        if original_request.len() > headers_end {
+            let body = &original_request[headers_end..];
+            
+            // For JSON, HTML, or text bodies, rewrite domain references
+            let content_type = headers_lines.iter()
+                .find(|&line| line.to_lowercase().starts_with("content-type:"))
+                .map(|&line| line.to_lowercase());
+                
+            if let Some(ct) = content_type {
+                if ct.contains("json") || ct.contains("html") || ct.contains("text") {
+                    // Try to rewrite the body if it's text-based
+                    if let Ok(body_str) = String::from_utf8(body.to_vec()) {
+                        // Replace all occurrences of the original domain with the upstream domain
+                        let modified_body = body_str.replace(&original_host, upstream_domain);
+                        modified_request.extend_from_slice(modified_body.as_bytes());
+                    } else {
+                        // If not valid UTF-8, keep the original body
+                        modified_request.extend_from_slice(body);
+                    }
+                } else {
+                    // Binary data, keep as is
+                    modified_request.extend_from_slice(body);
+                }
+            } else {
+                // No content type, keep as is
+                modified_request.extend_from_slice(body);
+            }
+        }
+        
+        Ok(modified_request)
+    }
+    
+    // Forward the request to the upstream server and relay the response back
+    fn forward_to_upstream(
+        request: &[u8],
+        upstream_domain: &str,
+        client_tls_stream: &mut Stream<ServerConnection, TcpStream>,
+    ) -> Result<()> {
+        println!("Forwarding request to upstream: {}", upstream_domain);
+        
+        // Connect to the upstream server using native-tls which uses the system's certificate store
+        let upstream_addr = format!("{}:443", upstream_domain);
+        
+        // Create a TLS connector using native-tls
+        let tls_connector = native_tls::TlsConnector::builder()
+            .build()
+            .context("Failed to create TLS connector")?;
+            
+        // Connect to the server
+        let tcp_stream = TcpStream::connect(&upstream_addr)
+            .context(format!("Failed to connect to upstream: {}", upstream_addr))?;
+            
+        // Set TCP options
+        tcp_stream.set_nodelay(true)?;
+        
+        // Establish TLS connection
+        let mut tls_stream = tls_connector.connect(upstream_domain, tcp_stream)
+            .context(format!("Failed to establish TLS connection to {}", upstream_domain))?;
+        
+        // Send the request to the upstream server
+        tls_stream.write_all(request)
+            .context("Failed to send request to upstream server")?;
+        
+        // Read the response headers
+        let mut response_buffer = Vec::new();
+        let mut headers_end = None;
+        let mut buffer = [0; 8192];
+        
+        // Read data until we find the end of headers (marked by "\r\n\r\n")
+        while headers_end.is_none() {
+            match tls_stream.read(&mut buffer) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    response_buffer.extend_from_slice(&buffer[..n]);
+                    
+                    // Search for end of headers
+                    if response_buffer.len() >= 4 {
+                        for i in 0..response_buffer.len() - 3 {
+                            if &response_buffer[i..i+4] == b"\r\n\r\n" {
+                                headers_end = Some(i + 4);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // If we have the headers, break the loop
+                    if headers_end.is_some() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error reading response: {}", e);
+                    return Err(anyhow::anyhow!("Error reading response: {}", e));
+                }
+            }
+        }
+        
+        // Process and rewrite the response headers if needed
+        let modified_response = if let Some(headers_end) = headers_end {
+            let mut modified_response = Vec::new();
+            
+            // Convert to string for parsing
+            let headers_str = String::from_utf8_lossy(&response_buffer[..headers_end]);
+            let headers_lines: Vec<&str> = headers_str.lines().collect();
+            
+            if !headers_lines.is_empty() {
+                // Add the status line unchanged
+                modified_response.extend_from_slice(headers_lines[0].as_bytes());
+                modified_response.extend_from_slice(b"\r\n");
+                
+                // Process headers, modifying as needed
+                for &line in &headers_lines[1..] {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    
+                    // Skip any Access-Control-* headers, we'll add our own
+                    if line.to_lowercase().starts_with("access-control-") {
+                        continue;
+                    }
+                    
+                    // Keep other headers as is
+                    modified_response.extend_from_slice(line.as_bytes());
+                    modified_response.extend_from_slice(b"\r\n");
+                }
+                
+                // Add CORS headers to allow our remapped domain
+                modified_response.extend_from_slice(b"Access-Control-Allow-Origin: *\r\n");
+                modified_response.extend_from_slice(b"Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n");
+                modified_response.extend_from_slice(b"Access-Control-Allow-Headers: Content-Type, Authorization\r\n");
+                modified_response.extend_from_slice(b"Access-Control-Allow-Credentials: true\r\n");
+                
+                // End of headers
+                modified_response.extend_from_slice(b"\r\n");
+                
+                // Append response body we already have
+                if response_buffer.len() > headers_end {
+                    modified_response.extend_from_slice(&response_buffer[headers_end..]);
+                }
+            } else {
+                modified_response = response_buffer;
+            }
+            
+            modified_response
+        } else {
+            // No headers found, just use the original response
+            response_buffer
+        };
+        
+        // Send the modified response headers to the client
+        client_tls_stream.write_all(&modified_response)
+            .context("Failed to write modified response headers to client")?;
+        
+        // Continue reading and forwarding the rest of the response
+        let mut total_bytes = modified_response.len();
+        
+        loop {
+            match tls_stream.read(&mut buffer) {
+                Ok(0) => break, // End of stream
+                Ok(n) => {
+                    // Forward this chunk to the client
+                    client_tls_stream.write_all(&buffer[..n])
+                        .context("Failed to write response to client")?;
+                    total_bytes += n;
+                }
+                Err(e) => {
+                    eprintln!("Error reading from upstream: {}", e);
+                    break;
+                }
+            }
+        }
+        
+        println!("Forwarded {} bytes from upstream to client", total_bytes);
         Ok(())
     }
 }
